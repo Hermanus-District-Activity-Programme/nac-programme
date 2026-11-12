@@ -61,7 +61,7 @@ def fetch(table):
 
 
 # ---------- Header ----------
-st.title(""Hermanus District Programme" · Pastoral Programme")
+st.title("Hermanus District Programme · Pastoral Programme")
 with st.sidebar:
     st.write(user.email)
     if admin:
