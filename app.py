@@ -64,7 +64,8 @@ def fetch(table):
 st.title("Cape-Coastal Area · Pastoral Programme")
 with st.sidebar:
     st.write(user.email)
-    st.success("Admin (can edit)")        if admin:
+    st.success("Admin (can edit)")        
+    if admin:
            st.success("Admin (can edit)")
        else:
            st.info("View only")
