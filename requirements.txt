@@ -2,4 +2,4 @@ streamlit>=1.40
 supabase>=2.9
 pandas
 openpyxl
-fpdf2>=2.7
+reportlab
