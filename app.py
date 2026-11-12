@@ -5,7 +5,7 @@ import pandas as pd
 import streamlit as st
 from supabase import create_client
 
-st.set_page_config(page_title="Cape-Coastal Programme", layout="wide")
+st.set_page_config(page_title="Hermanus District Programme", layout="wide")
 
 DEFAULT_PEOPLE = ["DA Lambert", "AP R Worship", "DR C. Fredericks", "REMARKS"]
 
@@ -21,7 +21,7 @@ sb = st.session_state.sb
 
 
 def login_screen():
-    st.title("Cape-Coastal Programme")
+    st.title("Hermanus District Programme")
     t_in, t_up = st.tabs(["Sign in", "Create viewer account"])
     with t_in:
         with st.form("in"):
@@ -61,7 +61,7 @@ def fetch(table):
 
 
 # ---------- Header ----------
-st.title("Cape-Coastal Area · Pastoral Programme")
+st.title(""Hermanus District Programme" · Pastoral Programme")
 with st.sidebar:
     st.write(user.email)
     if admin:
