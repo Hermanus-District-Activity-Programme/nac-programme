@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 from supabase import create_client
 
-APP_NAME = "Hermanus District Pastoral Programme"
+APP_NAME = "Hermanus District Pastoral"
 st.set_page_config(page_title=f"{APP_NAME} Programme", layout="wide")
 
 DEFAULT_PEOPLE = ["DA Lambert", "AP R Worship", "DR C. Fredericks", "REMARKS"]
