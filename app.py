@@ -64,7 +64,10 @@ def fetch(table):
 st.title("Cape-Coastal Area · Pastoral Programme")
 with st.sidebar:
     st.write(user.email)
-    st.success("Admin (can edit)") if admin else st.info("View only")
+    st.success("Admin (can edit)")        if admin:
+           st.success("Admin (can edit)")
+       else:
+           st.info("View only")
     if st.button("Sign out"):
         sb.auth.sign_out()
         del st.session_state["user"]
