@@ -272,6 +272,25 @@ def do_delete_user(uid, email, svc):
         st.session_state.msg = f"Could not delete {email}: {e}"
 
 
+def do_remove_date(d):
+    """Super Administrators only: removes a service date and any bookings entered for it."""
+    if not is_super:
+        return
+    try:
+        sb.table("bookings").delete().eq("service_date", d).execute()
+        sb.table("service_dates").delete().eq("service_date", d).execute()
+        y, m = int(d[:4]), int(d[5:7])
+        left = (sb.table("service_dates").select("service_date")
+                .gte("service_date", f"{y}-{m:02d}-01")
+                .lte("service_date", f"{y}-{m:02d}-{calendar.monthrange(y, m)[1]:02d}").execute().data)
+        if not left:
+            st.session_state.pop("month", None)  # that month no longer has any dates
+        st.session_state.pop("rm_date", None)
+        st.session_state.msg = f"Removed {date.fromisoformat(d).strftime('%a %d %B')}."
+    except Exception as e:
+        st.session_state.msg = f"Could not remove the date: {e}"
+
+
 def do_import():
     """Runs when the admin confirms an Excel import: replaces that month's data."""
     P = st.session_state.get("imp_parsed")
@@ -456,6 +475,18 @@ with tab_b:
             if st.button("Add date"):
                 sb.table("service_dates").upsert({"service_date": nd.isoformat()}).execute()
                 st.rerun()
+
+        with st.expander("Remove a service date"):
+            if mdates:
+                rd = st.selectbox("Date to remove", mdates, key="rm_date",
+                                  format_func=lambda d: date.fromisoformat(d).strftime("%a %d %B"))
+                n = sum(1 for (_, dd) in book if dd == rd)
+                st.caption(f"{n} booking(s) entered for this date will also be removed." if n
+                           else "No bookings are entered for this date.")
+                ok = st.checkbox("Yes, remove this service date", key=f"rm_ok_{rd}")
+                st.button("Remove date", disabled=not ok, on_click=do_remove_date, args=(rd,))
+            else:
+                st.caption("There are no service dates in this month.")
 
 # ---------- Activity programme ----------
 with tab_a:
