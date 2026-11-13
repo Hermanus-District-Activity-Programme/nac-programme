@@ -472,7 +472,8 @@ if is_super:
                    "and ask them to change it under 'Change my password' after signing in.")
         svc = st.secrets.get("SUPABASE_SERVICE_KEY")
         if not svc:
-            st.info("This needs the 'SUPABASE_SERVICE_KEY' secret to be added in Streamlit (Settings > Secrets).")
+            st.info("This needs the 'SUPABASE_SERVICE_KEY' secret to be added in Streamlit (Settings > Secrets). "
+                    "Secret names this app can see right now: " + (", ".join(st.secrets.keys()) or "none"))
         elif uid == user.id:
             st.caption("To change your own password, use 'Change my password' in the sidebar.")
         else:
@@ -494,7 +495,8 @@ if is_super:
         st.caption("Permanently removes the account and its access. Bookings and programme entries are not affected, "
                    "and the person can create a new account later.")
         if not svc:
-            st.info("This needs the 'SUPABASE_SERVICE_KEY' secret to be added in Streamlit (Settings > Secrets).")
+            st.info("This needs the 'SUPABASE_SERVICE_KEY' secret to be added in Streamlit (Settings > Secrets). "
+                    "Secret names this app can see right now: " + (", ".join(st.secrets.keys()) or "none"))
         elif uid == user.id:
             st.caption("You can't delete your own account.")
         else:
