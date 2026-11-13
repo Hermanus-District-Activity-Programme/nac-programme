@@ -1,12 +1,16 @@
 import calendar
 import io
+from string import capwords
 from datetime import date
 
 import pandas as pd
 import streamlit as st
 from supabase import create_client
 
-APP_NAME = "Hermanus District - Activity"
+from programme_export import build_excel, build_pdf, make_model
+from programme_import import norm, parse
+
+APP_NAME = "Hermanus District"
 st.set_page_config(page_title=f"{APP_NAME} Programme", layout="wide")
 
 DEFAULT_PEOPLE = ["DA Lambert", "AP R Worship", "DR C. Fredericks", "REMARKS"]
@@ -84,43 +88,54 @@ def add_month():
         st.session_state.msg = f"Could not add the month: {e}"
 
 
-# ---------- Exports ----------
-def to_excel(sheets):
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        for name, df in sheets:
-            df.to_excel(xw, sheet_name=name, index=False)
-            ws = xw.sheets[name]
-            ws.freeze_panes = "A2"
-            for col in ws.columns:
-                width = max(len(str(c.value or "")) for c in col) + 2
-                ws.column_dimensions[col[0].column_letter].width = min(40, width)
-    return buf.getvalue()
+def _chunks(rows, n=400):
+    for i in range(0, len(rows), n):
+        yield rows[i:i + n]
 
 
-def to_pdf(title, sheets):
-    from fpdf import FPDF
-
-    def clean(s):
-        return str(s).encode("latin-1", "replace").decode("latin-1")
-
-    pdf = FPDF(orientation="L", format="A4")
-    pdf.set_margins(8, 8, 8)
-    pdf.set_auto_page_break(True, 8)
-    for name, df, widths in sheets:
-        pdf.add_page()
-        pdf.set_font("Helvetica", "B", 13)
-        pdf.cell(0, 8, clean(f"{title} - {name}"), new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("Helvetica", size=7)
-        with pdf.table(col_widths=widths, line_height=4.5, text_align="LEFT") as table:
-            head = table.row()
-            for c in df.columns:
-                head.cell(clean(c))
-            for _, r in df.iterrows():
-                row = table.row()
-                for v in r:
-                    row.cell(clean(val(v)))
-    return bytes(pdf.output())
+def do_import():
+    """Runs when the admin confirms an Excel import: replaces that month's data."""
+    P = st.session_state.get("imp_parsed")
+    if not P or not P["month"]:
+        return
+    try:
+        y, m = P["month"]
+        first = date(y, m, 1).isoformat()
+        last = date(y, m, calendar.monthrange(y, m)[1]).isoformat()
+        existing = fetch("congregations")
+        idx = {norm(c["name"]): c["id"] for c in existing}
+        nxt = max([c["sort"] for c in existing], default=0)
+        for district, name, _ in P["book_rows"]:
+            if norm(name) not in idx:
+                nxt += 1
+                new = sb.table("congregations").insert(
+                    {"district": district or "District", "name": capwords(name), "sort": nxt}).execute().data[0]
+                idx[norm(name)] = new["id"]
+        n_b = n_a = 0
+        if P["book_rows"]:
+            sb.table("bookings").delete().gte("service_date", first).lte("service_date", last).execute()
+            sb.table("service_dates").delete().gte("service_date", first).lte("service_date", last).execute()
+            if P["dates"]:
+                sb.table("service_dates").upsert([{"service_date": d} for d in P["dates"]]).execute()
+            rows = {}
+            for _, name, vals in P["book_rows"]:
+                for iso, v in vals.items():
+                    cid = idx[norm(name)]
+                    rows[(cid, iso)] = {"congregation_id": cid, "service_date": iso, "minister": v}
+            for ch in _chunks(list(rows.values())):
+                sb.table("bookings").upsert(ch).execute()
+            n_b = len(rows)
+        if P["acts"]:
+            sb.table("activities").delete().gte("act_date", first).lte("act_date", last).execute()
+            arows = [{"act_date": d, "person": p, "entry": v} for (d, p), v in P["acts"].items()]
+            for ch in _chunks(arows):
+                sb.table("activities").upsert(ch).execute()
+            n_a = len(arows)
+        if P["dates"]:
+            st.session_state.month = f"{y}-{m:02d}"
+        st.session_state.msg = f"Imported {month_label(f'{y}-{m:02d}')}: {n_b} bookings and {n_a} programme entries."
+    except Exception as e:
+        st.session_state.msg = f"Import failed: {e}"
 
 
 # ---------- Header ----------
@@ -174,26 +189,21 @@ full_a = pd.DataFrame(
      for d in days]
 ).set_index("iso")
 
-# ---------- Downloads ----------
-exp_b = full_b.reset_index(drop=True).rename(columns={d: date.fromisoformat(d).strftime("%a %d") for d in mdates})
-exp_a = full_a.reset_index(drop=True)
+# ---------- Downloads (styled like the original workbook) ----------
+M = make_model(month, cong, mdates, book, acts, people)
 d1, d2, _ = st.columns([1, 1, 3])
 try:
-    d1.download_button("Download Excel", to_excel([("Service bookings", exp_b), ("Activity programme", exp_a)]),
-                       file_name=f"Programme_{month}.xlsx",
+    d1.download_button("Download Excel", build_excel(M), file_name=f"Programme_{month}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 except Exception as e:
     d1.error(f"Excel export unavailable: {e}")
 try:
-    w_b = (2.6, 2.4) + (3,) * len(mdates)
-    w_a = (1.4,) + (3,) * (len(people) - 1) + (4,)
-    d2.download_button("Download PDF", to_pdf(f"{APP_NAME} - {month_label(month)}",
-                       [("Service bookings", exp_b, w_b), ("Activity programme", exp_a, w_a)]),
-                       file_name=f"Programme_{month}.pdf", mime="application/pdf")
+    d2.download_button("Download PDF", build_pdf(M), file_name=f"Programme_{month}.pdf", mime="application/pdf")
 except Exception as e:
     d2.error(f"PDF export unavailable: {e}")
 
-tab_b, tab_a = st.tabs(["Service bookings", "Activity programme"])
+tabs = st.tabs(["Service bookings", "Activity programme"] + (["Import from Excel"] if admin else []))
+tab_b, tab_a = tabs[0], tabs[1]
 
 # ---------- Service bookings ----------
 with tab_b:
@@ -247,3 +257,50 @@ with tab_a:
             st.rerun()
         except Exception as e:
             st.error(f"Not saved: {e}")
+
+# ---------- Import from Excel (admins only) ----------
+if admin:
+    with tabs[2]:
+        st.write("Upload a programme workbook in the same layout as your original file, or one downloaded from this app. "
+                 "The app reads the **Activity Programme** and **Bookings** sheets and shows a preview. "
+                 "Nothing changes until you confirm.")
+        up = st.file_uploader("Excel file (.xlsx)", type=["xlsx"], key="imp_file")
+        if up:
+            data = up.getvalue()
+            try:
+                first = parse(data, None, people)
+            except Exception as e:
+                st.error(f"I could not read that file: {e}")
+                st.stop()
+            t = date.today()
+            opts, yy, mm = [], t.year - 1, t.month
+            for _ in range(48):
+                opts.append(f"{yy}-{mm:02d}")
+                yy, mm = (yy + 1, 1) if mm == 12 else (yy, mm + 1)
+            det = first["month"] or (t.year, t.month)
+            dflt = f"{det[0]}-{det[1]:02d}"
+            sel = st.selectbox("Month this file is for", opts, index=opts.index(dflt) if dflt in opts else 12,
+                               format_func=month_label, key=f"imp_month_{up.name}_{up.size}")
+            P = parse(data, tuple(map(int, sel.split("-"))), people)
+            st.session_state.imp_parsed = P
+            known = {norm(c["name"]) for c in cong}
+            nb, na = len(P["book_rows"]), len({d for (d, _) in P["acts"]})
+            st.info(f"Found {nb} congregations with {len(P['dates'])} service dates, and programme entries on {na} days.")
+            for w in P["warnings"]:
+                st.warning(w)
+            new_names = [n for _, n, _ in P["book_rows"] if norm(n) not in known]
+            if new_names:
+                st.warning("New congregations that will be added: " + ", ".join(new_names))
+            pb, pa = st.tabs(["Bookings preview", "Programme preview"])
+            with pb:
+                heads = {d: date.fromisoformat(d).strftime("%a %d") for d in P["dates"]}
+                st.dataframe(pd.DataFrame([{"District": dist, "Congregation": n, **{heads[d]: v.get(d, "") for d in P["dates"]}}
+                                           for dist, n, v in P["book_rows"]]), hide_index=True)
+            with pa:
+                ds = sorted({d for (d, _) in P["acts"]})
+                cols = P["persons"] + ["REMARKS"]
+                st.dataframe(pd.DataFrame([{"Date": date.fromisoformat(d).strftime("%a %d"),
+                                            **{p: P["acts"].get((d, p), "") for p in cols}} for d in ds]), hide_index=True)
+            ok = st.checkbox(f"Replace the existing {month_label(sel)} bookings and programme with this file", key=f"imp_ok_{sel}")
+            st.caption("Tip: use Download Excel first if you want a backup of what is currently in the app.")
+            st.button("Import into the app", type="primary", disabled=not ok or not (nb or na), on_click=do_import)
