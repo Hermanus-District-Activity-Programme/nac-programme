@@ -1,4 +1,5 @@
 import calendar
+import secrets as pysecrets
 import io
 from string import capwords
 from datetime import date
@@ -14,7 +15,12 @@ APP_NAME = "Hermanus District"
 st.set_page_config(page_title=f"{APP_NAME} Programme", layout="wide")
 
 DEFAULT_PEOPLE = ["DA Lambert", "AP R Worship", "DR C. Fredericks", "REMARKS"]
+EMAIL_RESET = False  # set to True once a custom email service is connected in Supabase
 WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def _gen_pw():
+    return "".join(pysecrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(10))
 
 
 def val(x):
@@ -33,18 +39,19 @@ sb = st.session_state.sb
 
 def login_screen():
     st.title(f"{APP_NAME} Programme")
-    t_in, t_up = st.tabs(["Sign in", "Create viewer account"])
+    t_in, t_up, t_rs = st.tabs(["Sign in", "Create viewer account", "Forgot password?"])
     with t_in:
         with st.form("in"):
             email = st.text_input("Email")
             pw = st.text_input("Password", type="password")
             if st.form_submit_button("Sign in", type="primary"):
                 try:
-                    res = sb.auth.sign_in_with_password({"email": email, "password": pw})
+                    res = sb.auth.sign_in_with_password({"email": email.strip(), "password": pw})
                     st.session_state.user = res.user
                     st.rerun()
                 except Exception as e:
                     st.error(f"Could not sign in: {e}")
+        st.caption("Forgot your password? Open the 'Forgot password?' tab.")
     with t_up:
         with st.form("up"):
             n1, n2 = st.columns(2)
@@ -52,18 +59,57 @@ def login_screen():
             sur = n2.text_input("Surname", key="sn2")
             email = st.text_input("Email", key="e2")
             pw = st.text_input("Password (min 6 characters)", type="password", key="p2")
+            pw2 = st.text_input("Confirm password", type="password", key="p3")
             if st.form_submit_button("Create account"):
                 if not first.strip() or not sur.strip():
                     st.error("Please enter your first name and surname.")
-                    st.stop()
-                try:
-                    sb.auth.sign_up({"email": email, "password": pw,
-                                     "options": {"data": {"first_name": first.strip(), "surname": sur.strip()}}})
-                    st.success("Account created. Check your email if confirmation is required, then sign in.")
-                except Exception as e:
-                    st.error(str(e))
+                elif len(pw) < 6:
+                    st.error("The password must be at least 6 characters.")
+                elif pw != pw2:
+                    st.error("The two passwords do not match. Please type them again.")
+                else:
+                    try:
+                        sb.auth.sign_up({"email": email.strip(), "password": pw,
+                                         "options": {"data": {"first_name": first.strip(), "surname": sur.strip()}}})
+                        st.success("Account created. Check your email if confirmation is required, then sign in.")
+                    except Exception as e:
+                        st.error(str(e))
         st.caption("New accounts can view only. An administrator can grant edit rights.")
-
+    with t_rs:
+        if not EMAIL_RESET:
+            st.info("Forgot your password? Please contact a Super Administrator. They can set a temporary password "
+                    "for you, and you can then change it inside the app under 'Change my password'.")
+        else:
+            st.write("**Step 1.** Enter your email and we will send you a code.")
+            with st.form("rs1"):
+                em = st.text_input("Email", key="rs_email")
+                if st.form_submit_button("Send me a code"):
+                    try:
+                        sb.auth.reset_password_for_email(em.strip())
+                        st.success("If that email has an account, a code is on its way. Check your inbox and spam folder.")
+                    except Exception as e:
+                        st.error(f"Could not send the code: {e}")
+            st.write("**Step 2.** Type the code from the email and choose a new password.")
+            with st.form("rs2"):
+                em2 = st.text_input("Email", key="rs_email2")
+                code = st.text_input("Code from the email", key="rs_code")
+                p1 = st.text_input("New password (min 6 characters)", type="password", key="rs_p1")
+                p2 = st.text_input("Confirm new password", type="password", key="rs_p2")
+                if st.form_submit_button("Set new password", type="primary"):
+                    if not em2.strip() or not code.strip():
+                        st.error("Please enter your email and the code.")
+                    elif len(p1) < 6:
+                        st.error("The password must be at least 6 characters.")
+                    elif p1 != p2:
+                        st.error("The two passwords do not match. Please type them again.")
+                    else:
+                        try:
+                            sb.auth.verify_otp({"email": em2.strip(), "token": code.strip(), "type": "recovery"})
+                            sb.auth.update_user({"password": p1})
+                            sb.auth.sign_out()
+                            st.success("Your password has been changed. Open the Sign in tab and sign in with it.")
+                        except Exception as e:
+                            st.error(f"That did not work. Check the code, or ask for a new one. ({e})")
 
 if "user" not in st.session_state:
     login_screen()
@@ -169,6 +215,21 @@ with st.sidebar:
         st.success("Admin")
     else:
         st.info("View only")
+    with st.expander("Change my password"):
+        with st.form("chpw"):
+            np1 = st.text_input("New password (min 6 characters)", type="password", key="cp1")
+            np2 = st.text_input("Confirm new password", type="password", key="cp2")
+            if st.form_submit_button("Change password"):
+                if len(np1) < 6:
+                    st.error("The password must be at least 6 characters.")
+                elif np1 != np2:
+                    st.error("The two passwords do not match.")
+                else:
+                    try:
+                        sb.auth.update_user({"password": np1})
+                        st.success("Your password has been changed.")
+                    except Exception as e:
+                        st.error(f"Could not change the password: {e}")
     if st.button("Sign out"):
         sb.auth.sign_out()
         del st.session_state["user"]
@@ -393,3 +454,26 @@ if is_super:
                     st.rerun()
                 except Exception as e:
                     st.error(f"Not saved: {e}")
+        st.divider()
+        st.markdown("**Set a temporary password**")
+        st.caption("For someone who has forgotten their password. Send it to them privately (for example on WhatsApp) "
+                   "and ask them to change it under 'Change my password' after signing in.")
+        svc = st.secrets.get("SUPABASE_SERVICE_KEY")
+        if not svc:
+            st.info("This needs the 'SUPABASE_SERVICE_KEY' secret to be added in Streamlit (Settings > Secrets).")
+        elif uid == user.id:
+            st.caption("To change your own password, use 'Change my password' in the sidebar.")
+        else:
+            tp = st.text_input("Temporary password (min 6 characters)", value=st.session_state.setdefault(f"tp_{uid}", _gen_pw()),
+                               key=f"mu_tp_{uid}")
+            if st.button(f"Set temporary password for {full(cur)}", key="mu_reset"):
+                if len(tp) < 6:
+                    st.error("The password must be at least 6 characters.")
+                else:
+                    try:
+                        admin_sb = create_client(st.secrets["SUPABASE_URL"], svc)
+                        admin_sb.auth.admin.update_user_by_id(uid, {"password": tp})
+                        st.success(f"Done. Send this temporary password to {full(cur)}:")
+                        st.code(tp, language=None)
+                    except Exception as e:
+                        st.error(f"Could not set the password: {e}")
