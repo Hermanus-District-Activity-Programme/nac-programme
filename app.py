@@ -77,7 +77,7 @@ def login_screen():
         st.caption("New accounts can view only. An administrator can grant edit rights.")
     with t_rs:
         if not EMAIL_RESET:
-            st.info("Forgot your password? Please contact the District Rector or the System Administrator. They can set a temporary password "
+            st.info("Forgot your password? Please contact a Super Administrator. They can set a temporary password "
                     "for you, and you can then change it inside the app under 'Change my password'.")
         else:
             st.write("**Step 1.** Enter your email and we will send you a code.")
@@ -156,6 +156,18 @@ def add_month():
 def _chunks(rows, n=400):
     for i in range(0, len(rows), n):
         yield rows[i:i + n]
+
+
+def do_delete_user(uid, email, svc):
+    """Super Administrators only: permanently removes a login (their profile and assignments go with it)."""
+    if not is_super or uid == user.id:
+        return
+    try:
+        create_client(st.secrets["SUPABASE_URL"], svc).auth.admin.delete_user(uid)
+        st.session_state.pop("mu_who", None)
+        st.session_state.msg = f"Deleted {email}."
+    except Exception as e:
+        st.session_state.msg = f"Could not delete {email}: {e}"
 
 
 def do_import():
@@ -477,3 +489,15 @@ if is_super:
                         st.code(tp, language=None)
                     except Exception as e:
                         st.error(f"Could not set the password: {e}")
+        st.divider()
+        st.markdown("**Delete this user**")
+        st.caption("Permanently removes the account and its access. Bookings and programme entries are not affected, "
+                   "and the person can create a new account later.")
+        if not svc:
+            st.info("This needs the 'SUPABASE_SERVICE_KEY' secret to be added in Streamlit (Settings > Secrets).")
+        elif uid == user.id:
+            st.caption("You can't delete your own account.")
+        else:
+            sure = st.checkbox(f"Yes, permanently delete {full(cur)} ({cur['email']})", key=f"mu_del_ok_{uid}")
+            st.button("Delete user", disabled=not sure, key="mu_del", on_click=do_delete_user,
+                      args=(uid, cur["email"], svc))
