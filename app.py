@@ -1,4 +1,5 @@
 import calendar
+import json
 import secrets as pysecrets
 import io
 from string import capwords
@@ -6,6 +7,7 @@ from datetime import date
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from supabase import create_client
 
 from programme_export import build_excel, build_pdf, make_model
@@ -39,6 +41,8 @@ sb = st.session_state.sb
 
 def login_screen():
     st.title(f"{APP_NAME} Programme")
+    if st.session_state.pop("idle_msg", None):
+        st.warning(f"You were signed out because you were inactive for {IDLE_MINUTES} minutes. Please sign in again.")
     t_in, t_up, t_rs = st.tabs(["Sign in", "Create viewer account", "Forgot password?"])
     with t_in:
         with st.form("in"):
@@ -48,6 +52,8 @@ def login_screen():
                 try:
                     res = sb.auth.sign_in_with_password({"email": email.strip(), "password": pw})
                     st.session_state.user = res.user
+                    st.session_state.cookie_js = res.session.refresh_token  # remember this browser
+                    st.session_state.pop("no_restore", None)
                     st.rerun()
                 except Exception as e:
                     st.error(f"Could not sign in: {e}")
@@ -111,11 +117,107 @@ def login_screen():
                         except Exception as e:
                             st.error(f"That did not work. Check the code, or ask for a new one. ({e})")
 
+# ---------- Stay signed in after a page refresh ----------
+COOKIE, DAYS = "hm_rt", 30
+IDLE_MINUTES, WARN_SECONDS = 10, 10  # sign out after 10 minutes of inactivity, with a 10-second countdown
+if st.query_params.get("idle"):  # the browser sent us here after the countdown ended
+    saved = st.context.cookies.get(COOKIE)
+    if saved:
+        try:
+            sb.auth.refresh_session(saved)
+            sb.auth.sign_out()  # also cancels the saved login on Supabase's side
+        except Exception:
+            pass
+    st.session_state.cookie_js = ""
+    st.session_state.no_restore = True
+    st.session_state.idle_msg = True
+    st.query_params.clear()
+if "user" not in st.session_state and not st.session_state.get("no_restore"):
+    saved = st.context.cookies.get(COOKIE)
+    if saved:
+        try:
+            res = sb.auth.refresh_session(saved)
+            st.session_state.user = res.user
+            st.session_state.cookie_js = res.session.refresh_token  # tokens rotate, so store the new one
+        except Exception:
+            st.session_state.cookie_js = ""  # stale cookie: clear it
+
+
+def write_cookie(tok):
+    """Saves (or, if tok is empty, deletes) the login token in the browser."""
+    age = DAYS * 24 * 3600 if tok else 0
+    components.html(
+        "<script>var c=%s+'='+%s+'; max-age=%d; path=/; SameSite=Lax; Secure';"
+        "try{window.parent.document.cookie=c}catch(e){document.cookie=c}</script>"
+        % (json.dumps(COOKIE), json.dumps(tok), age), height=0)
+
+
+if "cookie_js" in st.session_state:
+    tok = st.session_state.pop("cookie_js")
+    st.session_state.rt_last = tok
+    write_cookie(tok)
+
 if "user" not in st.session_state:
     login_screen()
     st.stop()
 
 user = st.session_state.user
+
+
+@st.fragment(run_every="4m")
+def keep_alive():
+    """Quiet check every 4 minutes: keeps the connection and login fresh, and keeps the saved token current."""
+    try:
+        sess = sb.auth.get_session()
+        if sess and sess.refresh_token != st.session_state.get("rt_last"):
+            st.session_state.rt_last = sess.refresh_token
+            write_cookie(sess.refresh_token)
+    except Exception:
+        pass
+
+
+keep_alive()
+
+IDLE_HTML = """<script>
+(function(){
+  var P = window.parent, D = P.document;
+  var IDLE = __IDLE__, WARN = __WARN__;
+  if (P.__hmIdleStop) { try { P.__hmIdleStop(); } catch (e) {} }
+  var last = Date.now(), warnStart = null, box = null;
+  var evs = ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart', 'wheel'];
+  function activity() { if (!box) last = Date.now(); }
+  evs.forEach(function (e) { D.addEventListener(e, activity, true); });
+  function hide() { if (box && box.parentNode) box.parentNode.removeChild(box); box = null; warnStart = null; last = Date.now(); }
+  function stop() {
+    clearInterval(iv);
+    evs.forEach(function (e) { D.removeEventListener(e, activity, true); });
+    if (box && box.parentNode) box.parentNode.removeChild(box);
+  }
+  function signout() { stop(); P.location.href = P.location.pathname + '?idle=1'; }
+  function show() {
+    warnStart = Date.now();
+    box = D.createElement('div');
+    box.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:999999;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;font-family:sans-serif';
+    box.innerHTML = '<div style="background:#262730;color:#fff;padding:28px 32px;border-radius:12px;max-width:380px;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.5)">'
+      + '<div style="font-size:18px;font-weight:600;margin-bottom:10px">Are you still there?</div>'
+      + '<div style="margin-bottom:18px">You will be signed out in <b id="hm-count" style="font-size:22px">' + WARN + '</b> seconds because of inactivity.</div>'
+      + '<button id="hm-stay" style="background:#ff4b4b;color:#fff;border:0;border-radius:8px;padding:10px 22px;font-size:15px;cursor:pointer">Stay signed in</button></div>';
+    D.body.appendChild(box);
+    var b = D.getElementById('hm-stay'); b.onclick = hide; b.focus();
+  }
+  var iv = setInterval(function () {
+    var now = Date.now();
+    if (!box && now - last >= IDLE) { show(); }
+    else if (box) {
+      var left = WARN - Math.floor((now - warnStart) / 1000);
+      var c = D.getElementById('hm-count'); if (c) c.textContent = Math.max(left, 0);
+      if (left <= 0) signout();
+    }
+  }, 1000);
+  P.__hmIdleStop = stop;
+})();
+</script>"""
+components.html(IDLE_HTML.replace("__IDLE__", str(IDLE_MINUTES * 60000)).replace("__WARN__", str(WARN_SECONDS)), height=0)
 try:
     rows = sb.table("profiles").select("role,first_name,surname").eq("id", user.id).execute().data
 except Exception:  # names column not created yet
@@ -245,6 +347,8 @@ with st.sidebar:
     if st.button("Sign out"):
         sb.auth.sign_out()
         del st.session_state["user"]
+        st.session_state.cookie_js = ""  # forget this browser
+        st.session_state.no_restore = True
         st.rerun()
 
 if "msg" in st.session_state:
