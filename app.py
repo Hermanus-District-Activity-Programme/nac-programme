@@ -64,7 +64,15 @@ if "user" not in st.session_state:
 
 user = st.session_state.user
 rows = sb.table("profiles").select("role").eq("id", user.id).execute().data
-admin = bool(rows) and rows[0]["role"] == "admin"
+role = rows[0]["role"] if rows else "viewer"
+if role not in ("viewer", "admin", "superadmin"):
+    role = "viewer"
+is_super = role == "superadmin"
+my_cong = set()  # congregations an Admin may edit
+if role == "admin":
+    my_cong = {r["congregation_id"] for r in
+               sb.table("admin_congregations").select("congregation_id").eq("user_id", user.id).execute().data}
+admin = is_super  # full editing rights: programme, months, Excel import, users
 
 
 def fetch(table):
@@ -142,8 +150,10 @@ def do_import():
 st.title(f"{APP_NAME} · Pastoral Programme")
 with st.sidebar:
     st.write(user.email)
-    if admin:
-        st.success("Admin (can edit)")
+    if is_super:
+        st.success("Super Administrator")
+    elif role == "admin":
+        st.success("Admin")
     else:
         st.info("View only")
     if st.button("Sign out"):
@@ -158,6 +168,9 @@ cong = sorted(fetch("congregations"), key=lambda c: c["sort"])
 dates = sorted(r["service_date"] for r in fetch("service_dates"))
 book = {(b["congregation_id"], b["service_date"]): b["minister"] for b in fetch("bookings")}
 acts = {(a["act_date"], a["person"]): a["entry"] for a in fetch("activities")}
+if role == "admin":
+    cnames = [c["name"] for c in cong if c["id"] in my_cong]
+    st.sidebar.caption("You can edit: " + (", ".join(cnames) if cnames else "no congregation assigned yet"))
 
 months = sorted({d[:7] for d in dates}) or [date.today().strftime("%Y-%m")]
 this_month = date.today().strftime("%Y-%m")
@@ -202,28 +215,42 @@ try:
 except Exception as e:
     d2.error(f"PDF export unavailable: {e}")
 
-tabs = st.tabs(["Service bookings", "Activity programme"] + (["Import from Excel"] if admin else []))
+tabs = st.tabs(["Service bookings", "Activity programme"] + (["Import from Excel", "Manage users"] if is_super else []))
 tab_b, tab_a = tabs[0], tabs[1]
 
 # ---------- Service bookings ----------
 with tab_b:
     df = filter_rows(full_b)
     cfg = {d: st.column_config.TextColumn(date.fromisoformat(d).strftime("%a %d"), width="medium") for d in mdates}
-    edited = st.data_editor(df, column_config=cfg, hide_index=True, key=f"b{month}{q}",
-                            disabled=["District", "Congregation"] if admin else True)
-    changes = [(rid, d, val(edited.at[rid, d])) for rid in df.index for d in mdates
-               if val(edited.at[rid, d]) != val(df.at[rid, d])]
-    if admin and changes and st.button(f"Save {len(changes)} booking change(s)", type="primary"):
-        try:
-            for rid, d, n in changes:
-                if n:
-                    sb.table("bookings").upsert({"congregation_id": int(rid), "service_date": d, "minister": n}).execute()
-                else:
-                    sb.table("bookings").delete().eq("congregation_id", int(rid)).eq("service_date", d).execute()
-            st.toast("Saved")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Not saved: {e}")
+    if is_super or (role == "admin" and my_cong):
+        edit_df = df if is_super else df[df.index.isin(my_cong)]
+        if not is_super:
+            st.markdown("**Your congregation(s)** - you can edit these")
+        if len(edit_df):
+            edited = st.data_editor(edit_df, column_config=cfg, hide_index=True, key=f"b{month}{q}",
+                                    disabled=["District", "Congregation"])
+            changes = [(rid, d, val(edited.at[rid, d])) for rid in edit_df.index for d in mdates
+                       if val(edited.at[rid, d]) != val(edit_df.at[rid, d])]
+            if changes and st.button(f"Save {len(changes)} booking change(s)", type="primary"):
+                try:
+                    for rid, d, n in changes:
+                        if n:
+                            sb.table("bookings").upsert({"congregation_id": int(rid), "service_date": d, "minister": n}).execute()
+                        else:
+                            sb.table("bookings").delete().eq("congregation_id", int(rid)).eq("service_date", d).execute()
+                    st.toast("Saved")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Not saved: {e}")
+        else:
+            st.caption("None of your congregations match the search.")
+        if not is_super:
+            st.markdown("**All congregations** - view only")
+            st.dataframe(df, column_config=cfg, hide_index=True)
+    else:
+        if role == "admin":
+            st.info("No congregation has been assigned to you yet. Please ask a Super Administrator.")
+        st.dataframe(df, column_config=cfg, hide_index=True)
     if admin:
         with st.expander("Add a new month"):
             t = date.today()
@@ -304,3 +331,46 @@ if admin:
             ok = st.checkbox(f"Replace the existing {month_label(sel)} bookings and programme with this file", key=f"imp_ok_{sel}")
             st.caption("Tip: use Download Excel first if you want a backup of what is currently in the app.")
             st.button("Import into the app", type="primary", disabled=not ok or not (nb or na), on_click=do_import)
+
+# ---------- Manage users (Super Administrators only) ----------
+if is_super:
+    with tabs[3]:
+        LABEL = {"viewer": "View only", "admin": "Admin", "superadmin": "Super Administrator"}
+        profs = sorted(sb.table("profiles").select("*").execute().data, key=lambda p: p["email"] or "")
+        assign = {}
+        for r in sb.table("admin_congregations").select("*").execute().data:
+            assign.setdefault(r["user_id"], []).append(r["congregation_id"])
+        names = {c["id"]: c["name"] for c in cong}
+        st.dataframe(pd.DataFrame([{
+            "Email": p["email"], "Level": LABEL.get(p["role"], p["role"]),
+            "Can edit": "Everything" if p["role"] == "superadmin"
+            else ", ".join(names.get(i, "?") for i in assign.get(p["id"], [])) if p["role"] == "admin" else "",
+        } for p in profs]), hide_index=True)
+        st.markdown("**Change someone's level**")
+        st.caption("People appear here after they have created an account.")
+        emails = {p["id"]: p["email"] for p in profs}
+        uid = st.selectbox("Person", list(emails), format_func=lambda i: emails[i], key="mu_who")
+        cur = next(p for p in profs if p["id"] == uid)
+        levels = ["viewer", "admin", "superadmin"]
+        lvl = st.selectbox("Level", levels, index=levels.index(cur["role"]) if cur["role"] in levels else 0,
+                           format_func=LABEL.get, key=f"mu_lvl_{uid}")
+        picks = []
+        if lvl == "admin":
+            picks = st.multiselect("Congregation(s) this Admin may edit", list(names), format_func=names.get,
+                                   default=[i for i in assign.get(uid, []) if i in names], key=f"mu_c_{uid}")
+            if not picks:
+                st.caption("An Admin with no congregation can only view.")
+        if st.button("Save changes", type="primary", key="mu_save"):
+            if uid == user.id and lvl != "superadmin":
+                st.error("You can't lower your own level. Ask another Super Administrator to do it.")
+            else:
+                try:
+                    sb.table("profiles").update({"role": lvl}).eq("id", uid).execute()
+                    sb.table("admin_congregations").delete().eq("user_id", uid).execute()
+                    if lvl == "admin" and picks:
+                        sb.table("admin_congregations").insert(
+                            [{"user_id": uid, "congregation_id": i} for i in picks]).execute()
+                    st.toast("Saved")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Not saved: {e}")
