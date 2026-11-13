@@ -77,7 +77,7 @@ def login_screen():
         st.caption("New accounts can view only. An administrator can grant edit rights.")
     with t_rs:
         if not EMAIL_RESET:
-            st.info("Forgot your password? Please contact a Super Administrator. They can set a temporary password "
+            st.info("Forgot your password? Please contact the District Rector or the System Administrator. They can set a temporary password "
                     "for you, and you can then change it inside the app under 'Change my password'.")
         else:
             st.write("**Step 1.** Enter your email and we will send you a code.")
