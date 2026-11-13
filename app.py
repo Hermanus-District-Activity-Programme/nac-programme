@@ -47,11 +47,18 @@ def login_screen():
                     st.error(f"Could not sign in: {e}")
     with t_up:
         with st.form("up"):
+            n1, n2 = st.columns(2)
+            first = n1.text_input("First name", key="fn2")
+            sur = n2.text_input("Surname", key="sn2")
             email = st.text_input("Email", key="e2")
             pw = st.text_input("Password (min 6 characters)", type="password", key="p2")
             if st.form_submit_button("Create account"):
+                if not first.strip() or not sur.strip():
+                    st.error("Please enter your first name and surname.")
+                    st.stop()
                 try:
-                    sb.auth.sign_up({"email": email, "password": pw})
+                    sb.auth.sign_up({"email": email, "password": pw,
+                                     "options": {"data": {"first_name": first.strip(), "surname": sur.strip()}}})
                     st.success("Account created. Check your email if confirmation is required, then sign in.")
                 except Exception as e:
                     st.error(str(e))
@@ -63,8 +70,12 @@ if "user" not in st.session_state:
     st.stop()
 
 user = st.session_state.user
-rows = sb.table("profiles").select("role").eq("id", user.id).execute().data
+try:
+    rows = sb.table("profiles").select("role,first_name,surname").eq("id", user.id).execute().data
+except Exception:  # names column not created yet
+    rows = sb.table("profiles").select("role").eq("id", user.id).execute().data
 role = rows[0]["role"] if rows else "viewer"
+my_name = " ".join(x for x in [rows[0].get("first_name"), rows[0].get("surname")] if x) if rows else ""
 if role not in ("viewer", "admin", "superadmin"):
     role = "viewer"
 is_super = role == "superadmin"
@@ -149,6 +160,8 @@ def do_import():
 # ---------- Header ----------
 st.title(f"{APP_NAME} · Pastoral Programme")
 with st.sidebar:
+    if my_name:
+        st.markdown(f"**{my_name}**")
     st.write(user.email)
     if is_super:
         st.success("Super Administrator")
@@ -336,21 +349,26 @@ if admin:
 if is_super:
     with tabs[3]:
         LABEL = {"viewer": "View only", "admin": "Admin", "superadmin": "Super Administrator"}
-        profs = sorted(sb.table("profiles").select("*").execute().data, key=lambda p: p["email"] or "")
+        full = lambda p: " ".join(x for x in [p.get("first_name"), p.get("surname")] if x) or "(no name yet)"
+        profs = sorted(sb.table("profiles").select("*").execute().data,
+                       key=lambda p: ((p.get("surname") or "~").lower(), (p.get("first_name") or "").lower(), p["email"] or ""))
         assign = {}
         for r in sb.table("admin_congregations").select("*").execute().data:
             assign.setdefault(r["user_id"], []).append(r["congregation_id"])
         names = {c["id"]: c["name"] for c in cong}
         st.dataframe(pd.DataFrame([{
-            "Email": p["email"], "Level": LABEL.get(p["role"], p["role"]),
+            "Name": full(p), "Email": p["email"], "Level": LABEL.get(p["role"], p["role"]),
             "Can edit": "Everything" if p["role"] == "superadmin"
             else ", ".join(names.get(i, "?") for i in assign.get(p["id"], [])) if p["role"] == "admin" else "",
         } for p in profs]), hide_index=True)
-        st.markdown("**Change someone's level**")
+        st.markdown("**Change someone's details or level**")
         st.caption("People appear here after they have created an account.")
-        emails = {p["id"]: p["email"] for p in profs}
-        uid = st.selectbox("Person", list(emails), format_func=lambda i: emails[i], key="mu_who")
+        label = {p["id"]: f"{full(p)} - {p['email']}" for p in profs}
+        uid = st.selectbox("Person", list(label), format_func=label.get, key="mu_who")
         cur = next(p for p in profs if p["id"] == uid)
+        n1, n2 = st.columns(2)
+        fn = n1.text_input("First name", value=cur.get("first_name") or "", key=f"mu_fn_{uid}")
+        sn = n2.text_input("Surname", value=cur.get("surname") or "", key=f"mu_sn_{uid}")
         levels = ["viewer", "admin", "superadmin"]
         lvl = st.selectbox("Level", levels, index=levels.index(cur["role"]) if cur["role"] in levels else 0,
                            format_func=LABEL.get, key=f"mu_lvl_{uid}")
@@ -365,7 +383,8 @@ if is_super:
                 st.error("You can't lower your own level. Ask another Super Administrator to do it.")
             else:
                 try:
-                    sb.table("profiles").update({"role": lvl}).eq("id", uid).execute()
+                    sb.table("profiles").update({"role": lvl, "first_name": fn.strip() or None,
+                                                 "surname": sn.strip() or None}).eq("id", uid).execute()
                     sb.table("admin_congregations").delete().eq("user_id", uid).execute()
                     if lvl == "admin" and picks:
                         sb.table("admin_congregations").insert(
