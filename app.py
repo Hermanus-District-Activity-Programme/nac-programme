@@ -43,6 +43,10 @@ def login_screen():
     st.title(f"{APP_NAME} Programme")
     if st.session_state.pop("idle_msg", None):
         st.warning(f"You were signed out because you were inactive for {IDLE_MINUTES} minutes. Please sign in again.")
+    note = st.session_state.get("restore_note")
+    if note:
+        with st.expander("Why was I signed out?"):
+            st.caption(note)
     t_in, t_up, t_rs = st.tabs(["Sign in", "Create viewer account", "Forgot password?"])
     with t_in:
         with st.form("in"):
@@ -140,15 +144,19 @@ if "user" not in st.session_state and not st.session_state.get("no_restore"):
             res = sb.auth.refresh_session(saved)
             st.session_state.user = res.user
             st.session_state.cookie_js = res.session.refresh_token  # tokens rotate, so store the new one
-        except Exception:
+            st.session_state.pop("restore_note", None)
+        except Exception as e:
             st.session_state.cookie_js = ""  # stale cookie: clear it
+            st.session_state.restore_note = f"A saved sign-in was found in this browser but Supabase rejected it ({e})."
+    else:
+        st.session_state.restore_note = "No saved sign-in was found in this browser (the cookie is missing or was not sent to the app)."
 
 
 def write_cookie(tok):
     """Saves (or, if tok is empty, deletes) the login token in the browser."""
     age = DAYS * 24 * 3600 if tok else 0
     components.html(
-        "<script>var c=%s+'='+%s+'; max-age=%d; path=/; SameSite=Lax; Secure';"
+        "<script>var c=%s+'='+%s+'; max-age=%d; path=/; SameSite=None; Secure';"
         "try{window.parent.document.cookie=c}catch(e){document.cookie=c}</script>"
         % (json.dumps(COOKIE), json.dumps(tok), age), height=0)
 
