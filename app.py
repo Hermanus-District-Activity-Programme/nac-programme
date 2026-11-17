@@ -260,6 +260,20 @@ def _chunks(rows, n=400):
         yield rows[i:i + n]
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def auth_details(url, svc):
+    """Sign-up date, last sign-in and email confirmation for every login (Super Administrators only)."""
+    res = create_client(url, svc).auth.admin.list_users(page=1, per_page=1000)
+    users = res if isinstance(res, list) else getattr(res, "users", [])
+    out = {}
+    for u in users:
+        out[str(u.id)] = dict(
+            created=str(getattr(u, "created_at", "") or "")[:10],
+            last=str(getattr(u, "last_sign_in_at", "") or "")[:10],
+            confirmed=bool(getattr(u, "email_confirmed_at", None) or getattr(u, "confirmed_at", None)))
+    return out
+
+
 def do_delete_user(uid, email, svc):
     """Super Administrators only: permanently removes a login (their profile and assignments go with it)."""
     if not is_super or uid == user.id:
@@ -424,8 +438,10 @@ try:
 except Exception as e:
     d2.error(f"PDF export unavailable: {e}")
 
-tabs = st.tabs(["Service bookings", "Activity programme"] + (["Import from Excel", "Manage users"] if is_super else []))
-tab_b, tab_a = tabs[0], tabs[1]
+tab_names = (["Dashboard"] if is_super else []) + ["Service bookings", "Activity programme"] \
+    + (["Import from Excel", "Manage users"] if is_super else [])
+T = dict(zip(tab_names, st.tabs(tab_names)))
+tab_b, tab_a = T["Service bookings"], T["Activity programme"]
 
 # ---------- Service bookings ----------
 with tab_b:
@@ -508,7 +524,7 @@ with tab_a:
 
 # ---------- Import from Excel (admins only) ----------
 if admin:
-    with tabs[2]:
+    with T["Import from Excel"]:
         st.write("Upload a programme workbook in the same layout as your original file, or one downloaded from this app. "
                  "The app reads the **Activity Programme** and **Bookings** sheets and shows a preview. "
                  "Nothing changes until you confirm.")
@@ -555,7 +571,7 @@ if admin:
 
 # ---------- Manage users (Super Administrators only) ----------
 if is_super:
-    with tabs[3]:
+    with T["Manage users"]:
         LABEL = {"viewer": "View only", "admin": "Admin", "superadmin": "Super Administrator"}
         full = lambda p: " ".join(x for x in [p.get("first_name"), p.get("surname")] if x) or "(no name yet)"
         profs = sorted(sb.table("profiles").select("*").execute().data,
@@ -638,3 +654,113 @@ if is_super:
             sure = st.checkbox(f"Yes, permanently delete {full(cur)} ({cur['email']})", key=f"mu_del_ok_{uid}")
             st.button("Delete user", disabled=not sure, key="mu_del", on_click=do_delete_user,
                       args=(uid, cur["email"], svc))
+
+# ---------- Dashboard (Super Administrators only) ----------
+if is_super:
+    with T["Dashboard"]:
+        LV = {"superadmin": "Super Administrator", "admin": "Admin", "viewer": "View only"}
+        fname = lambda p: " ".join(x for x in [p.get("first_name"), p.get("surname")] if x) or "(no name yet)"
+        dprofs = sb.table("profiles").select("*").execute().data
+        dassign = {}
+        for r in sb.table("admin_congregations").select("*").execute().data:
+            dassign.setdefault(r["user_id"], []).append(r["congregation_id"])
+        cn = {c["id"]: c["name"] for c in cong}
+        extra_info = None
+        svc_key = st.secrets.get("SUPABASE_SERVICE_KEY")
+        if svc_key:
+            try:
+                extra_info = auth_details(st.secrets["SUPABASE_URL"], svc_key)
+            except Exception:
+                extra_info = None
+
+        def status(p):
+            e = (extra_info or {}).get(str(p["id"]))
+            if e is None:
+                return ""
+            if not e["confirmed"]:
+                return "Awaiting email confirmation"
+            return "Active" if e["last"] else "Never signed in"
+
+        pending = [p for p in dprofs if status(p) == "Awaiting email confirmation"]
+        count = {k: sum(1 for p in dprofs if p["role"] == k) for k in LV}
+
+        st.subheader("People")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Signed up", len(dprofs))
+        m2.metric("Can sign in", len(dprofs) - len(pending) if extra_info is not None else "-")
+        m3.metric("Super Administrators", count["superadmin"])
+        m4.metric("Admins", count["admin"])
+        m5.metric("View only", count["viewer"])
+        if extra_info is None:
+            st.caption("Add the SUPABASE_SERVICE_KEY secret to also see sign-up dates, last sign-in and email confirmation.")
+
+        order = {"superadmin": 0, "admin": 1, "viewer": 2}
+        show = st.multiselect("Show levels", list(LV.values()), default=list(LV.values()), key="dash_levels")
+        rows_ = []
+        for p in sorted(dprofs, key=lambda p: (order.get(p["role"], 3), (p.get("surname") or "~").lower(), p["email"] or "")):
+            if LV.get(p["role"], p["role"]) not in show:
+                continue
+            e = (extra_info or {}).get(str(p["id"]), {})
+            rows_.append({"Name": fname(p), "Email": p["email"], "Level": LV.get(p["role"], p["role"]),
+                          "Can edit": "Everything" if p["role"] == "superadmin"
+                          else ", ".join(cn.get(i, "?") for i in dassign.get(p["id"], [])) if p["role"] == "admin" else "",
+                          "Signed up": e.get("created", ""), "Last sign-in": e.get("last") or ("Never" if e else ""),
+                          "Status": status(p)})
+        st.dataframe(pd.DataFrame(rows_), hide_index=True)
+        st.bar_chart(pd.DataFrame({"People": [count[k] for k in LV]}, index=list(LV.values())))
+
+        st.subheader("Needs attention")
+        flags = []
+        no_cong = [fname(p) for p in dprofs if p["role"] == "admin" and not dassign.get(p["id"])]
+        if no_cong:
+            flags.append("Admins with no congregation assigned: " + ", ".join(no_cong))
+        covered = {i for v in dassign.values() for i in v}
+        no_admin = [c["name"] for c in cong if c["id"] not in covered]
+        if no_admin:
+            flags.append("Congregations with no Admin: " + ", ".join(no_admin))
+        if pending:
+            flags.append("Waiting to confirm their email: " + ", ".join(p["email"] for p in pending))
+        if extra_info:
+            never = [p["email"] for p in dprofs if status(p) == "Never signed in"]
+            if never:
+                flags.append("Confirmed but never signed in: " + ", ".join(never))
+        unnamed = [p["email"] for p in dprofs if not (p.get("first_name") or p.get("surname"))]
+        if unnamed:
+            flags.append("No name on record: " + ", ".join(unnamed))
+        for f in flags:
+            st.warning(f)
+        if not flags:
+            st.success("Nothing needs attention.")
+
+        st.subheader(f"Programme - {month_label(month)}")
+        total = len(cong) * len(mdates)
+        filled = sum(1 for c in cong for d in mdates if val(book.get((c["id"], d), "")))
+        today = date.today().isoformat()
+        nxt = next((d for d in dates if d >= today), None)
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Service dates", len(mdates))
+        p2.metric("Bookings filled", f"{filled} of {total}")
+        p3.metric("Next service date", date.fromisoformat(nxt).strftime("%a %d %b") if nxt else "-")
+        if total:
+            st.progress(filled / total)
+        gaps = []
+        for c in cong:
+            miss = [date.fromisoformat(d).strftime("%a %d") for d in mdates if not val(book.get((c["id"], d), ""))]
+            if miss:
+                gaps.append({"Congregation": c["name"], "Dates still empty": ", ".join(miss)})
+        if gaps:
+            st.markdown("**Bookings still to fill**")
+            st.dataframe(pd.DataFrame(gaps), hide_index=True)
+        elif total:
+            st.success("Every service date has a booking.")
+        seen = {}
+        for (cid, d), v in book.items():
+            n = val(v).replace("(R)", "").strip().lower()
+            if d in mdates and n and "no service" not in n and not n.startswith("dr "):
+                seen.setdefault((d, n), []).append(cn.get(cid, "?"))
+        doubles = [f"{date.fromisoformat(d).strftime('%a %d')}: {n.title()} is booked at {', '.join(v)}"
+                   for (d, n), v in sorted(seen.items()) if len(v) > 1]
+        if doubles:
+            st.markdown("**Possible double bookings (please check)**")
+            for t in doubles:
+                st.warning(t)
