@@ -77,7 +77,8 @@ def login_screen():
                     try:
                         sb.auth.sign_up({"email": email.strip(), "password": pw,
                                          "options": {"data": {"first_name": first.strip(), "surname": sur.strip()}}})
-                        st.success("Account created. Check your email if confirmation is required, then sign in.")
+                        st.success("Account created. Check your email if confirmation is required, then sign in. "
+                                   "A Super Administrator must approve your account before you can see the programme.")
                     except Exception as e:
                         st.error(str(e))
         st.caption("New accounts can view only. An administrator can grant edit rights.")
@@ -224,7 +225,7 @@ except Exception:  # names column not created yet
     rows = sb.table("profiles").select("role").eq("id", user.id).execute().data
 role = rows[0]["role"] if rows else "viewer"
 my_name = " ".join(x for x in [rows[0].get("first_name"), rows[0].get("surname")] if x) if rows else ""
-if role not in ("viewer", "admin", "superadmin"):
+if role not in ("pending", "viewer", "admin", "superadmin"):
     role = "viewer"
 is_super = role == "superadmin"
 my_cong = set()  # congregations an Admin may edit
@@ -272,6 +273,17 @@ def auth_details(url, svc):
             last=str(getattr(u, "last_sign_in_at", "") or "")[:10],
             confirmed=bool(getattr(u, "email_confirmed_at", None) or getattr(u, "confirmed_at", None)))
     return out
+
+
+def do_approve(uid, email):
+    """Super Administrators only: lets a new sign-up in as View only."""
+    if not is_super:
+        return
+    try:
+        sb.table("profiles").update({"role": "viewer"}).eq("id", uid).execute()
+        st.session_state.msg = f"Approved {email} as View only. You can change their level under Manage users."
+    except Exception as e:
+        st.session_state.msg = f"Could not approve {email}: {e}"
 
 
 def do_delete_user(uid, email, svc):
@@ -360,6 +372,8 @@ with st.sidebar:
         st.success("Super Administrator")
     elif role == "admin":
         st.success("Admin")
+    elif role == "pending":
+        st.warning("Awaiting approval")
     else:
         st.info("View only")
     with st.expander("Change my password"):
@@ -383,6 +397,11 @@ with st.sidebar:
         st.session_state.cookie_js = ""  # forget this browser
         st.session_state.no_restore = True
         st.rerun()
+
+if role == "pending":
+    st.info("Your account has been created and is waiting for approval by a Super Administrator. "
+            "Please check back later.")
+    st.stop()
 
 if "msg" in st.session_state:
     st.toast(st.session_state.pop("msg"))
@@ -572,7 +591,7 @@ if admin:
 # ---------- Manage users (Super Administrators only) ----------
 if is_super:
     with T["Manage users"]:
-        LABEL = {"viewer": "View only", "admin": "Admin", "superadmin": "Super Administrator"}
+        LABEL = {"pending": "Awaiting approval", "viewer": "View only", "admin": "Admin", "superadmin": "Super Administrator"}
         full = lambda p: " ".join(x for x in [p.get("first_name"), p.get("surname")] if x) or "(no name yet)"
         profs = sorted(sb.table("profiles").select("*").execute().data,
                        key=lambda p: ((p.get("surname") or "~").lower(), (p.get("first_name") or "").lower(), p["email"] or ""))
@@ -593,7 +612,7 @@ if is_super:
         n1, n2 = st.columns(2)
         fn = n1.text_input("First name", value=cur.get("first_name") or "", key=f"mu_fn_{uid}")
         sn = n2.text_input("Surname", value=cur.get("surname") or "", key=f"mu_sn_{uid}")
-        levels = ["viewer", "admin", "superadmin"]
+        levels = ["pending", "viewer", "admin", "superadmin"]
         lvl = st.selectbox("Level", levels, index=levels.index(cur["role"]) if cur["role"] in levels else 0,
                            format_func=LABEL.get, key=f"mu_lvl_{uid}")
         picks = []
@@ -658,8 +677,9 @@ if is_super:
 # ---------- Dashboard (Super Administrators only) ----------
 if is_super:
     with T["Dashboard"]:
-        LV = {"superadmin": "Super Administrator", "admin": "Admin", "viewer": "View only"}
+        LV = {"superadmin": "Super Administrator", "admin": "Admin", "viewer": "View only", "pending": "Awaiting approval"}
         fname = lambda p: " ".join(x for x in [p.get("first_name"), p.get("surname")] if x) or "(no name yet)"
+        TZ = "Africa/Johannesburg"
         dprofs = sb.table("profiles").select("*").execute().data
         dassign = {}
         for r in sb.table("admin_congregations").select("*").execute().data:
@@ -681,23 +701,69 @@ if is_super:
                 return "Awaiting email confirmation"
             return "Active" if e["last"] else "Never signed in"
 
-        pending = [p for p in dprofs if status(p) == "Awaiting email confirmation"]
+        unconfirmed = [p for p in dprofs if status(p) == "Awaiting email confirmation"]
         count = {k: sum(1 for p in dprofs if p["role"] == k) for k in LV}
+        by_email = {(p["email"] or "").lower(): fname(p) for p in dprofs}
 
+        # --- change log (needs dashboard_migration.sql) ---
+        try:
+            log = sb.table("change_log").select("*").order("at", desc=True).limit(1000).execute().data
+            for r in log:
+                r["_t"] = pd.to_datetime(r["at"], utc=True).tz_convert(TZ)
+        except Exception:
+            log = None
+        now = pd.Timestamp.now(tz=TZ)
+
+        # --- Admin activity ---
+        arows, nudge = [], []
+        for p in dprofs:
+            if p["role"] != "admin":
+                continue
+            ids = dassign.get(p["id"], [])
+            mine = [r for r in (log or []) if r.get("user_id") == p["id"] and r["table_name"] == "bookings"]
+            last = max((r["_t"] for r in mine), default=None)
+            recent = sum(1 for r in mine if r["_t"] >= now - pd.Timedelta(days=30))
+            empty = sum(1 for cid in ids for d in mdates if not val(book.get((cid, d), "")))
+            if not ids:
+                state = "No congregation assigned"
+            elif empty == 0:
+                state = "Up to date"
+            elif last is None or (now - last).days >= 14:
+                state = "Needs a reminder"
+                nudge.append(fname(p))
+            else:
+                state = "In progress"
+            arows.append({"Admin": fname(p), "Congregation(s)": ", ".join(cn.get(i, "?") for i in ids),
+                          "Last update": last.strftime("%d %b %H:%M") if last is not None else "Never",
+                          "Changes (30 days)": recent, f"Empty dates in {month_label(month)}": empty, "Status": state})
+
+        # --- People ---
         st.subheader("People")
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Signed up", len(dprofs))
-        m2.metric("Can sign in", len(dprofs) - len(pending) if extra_info is not None else "-")
+        m2.metric("Awaiting approval", count["pending"])
         m3.metric("Super Administrators", count["superadmin"])
         m4.metric("Admins", count["admin"])
         m5.metric("View only", count["viewer"])
+        m6.metric("Email not confirmed", len(unconfirmed) if extra_info is not None else "-")
         if extra_info is None:
             st.caption("Add the SUPABASE_SERVICE_KEY secret to also see sign-up dates, last sign-in and email confirmation.")
 
-        order = {"superadmin": 0, "admin": 1, "viewer": 2}
+        pend = [p for p in dprofs if p["role"] == "pending"]
+        if pend:
+            st.markdown("**Waiting for your approval**")
+            for p in pend:
+                c_a, c_b, c_c = st.columns([5, 1, 1])
+                since = (extra_info or {}).get(str(p["id"]), {}).get("created", "")
+                c_a.write(f"**{fname(p)}** - {p['email']}" + (f" (signed up {since})" if since else ""))
+                c_b.button("Approve", key=f"ap_{p['id']}", type="primary", on_click=do_approve, args=(p["id"], p["email"]))
+                if svc_key:
+                    c_c.button("Decline", key=f"dc_{p['id']}", on_click=do_delete_user, args=(p["id"], p["email"], svc_key))
+
+        order = {"superadmin": 0, "admin": 1, "viewer": 2, "pending": 3}
         show = st.multiselect("Show levels", list(LV.values()), default=list(LV.values()), key="dash_levels")
         rows_ = []
-        for p in sorted(dprofs, key=lambda p: (order.get(p["role"], 3), (p.get("surname") or "~").lower(), p["email"] or "")):
+        for p in sorted(dprofs, key=lambda p: (order.get(p["role"], 4), (p.get("surname") or "~").lower(), p["email"] or "")):
             if LV.get(p["role"], p["role"]) not in show:
                 continue
             e = (extra_info or {}).get(str(p["id"]), {})
@@ -709,8 +775,11 @@ if is_super:
         st.dataframe(pd.DataFrame(rows_), hide_index=True)
         st.bar_chart(pd.DataFrame({"People": [count[k] for k in LV]}, index=list(LV.values())))
 
+        # --- Needs attention ---
         st.subheader("Needs attention")
         flags = []
+        if pend:
+            flags.append(f"{len(pend)} new sign-up(s) waiting for approval.")
         no_cong = [fname(p) for p in dprofs if p["role"] == "admin" and not dassign.get(p["id"])]
         if no_cong:
             flags.append("Admins with no congregation assigned: " + ", ".join(no_cong))
@@ -718,12 +787,14 @@ if is_super:
         no_admin = [c["name"] for c in cong if c["id"] not in covered]
         if no_admin:
             flags.append("Congregations with no Admin: " + ", ".join(no_admin))
-        if pending:
-            flags.append("Waiting to confirm their email: " + ", ".join(p["email"] for p in pending))
+        if nudge:
+            flags.append(f"Admins with empty dates who have not updated in 14 days: " + ", ".join(nudge))
+        if unconfirmed:
+            flags.append("Waiting to confirm their email: " + ", ".join(p["email"] for p in unconfirmed))
         if extra_info:
-            never = [p["email"] for p in dprofs if status(p) == "Never signed in"]
+            never = [p["email"] for p in dprofs if status(p) == "Never signed in" and p["role"] != "pending"]
             if never:
-                flags.append("Confirmed but never signed in: " + ", ".join(never))
+                flags.append("Approved but never signed in: " + ", ".join(never))
         unnamed = [p["email"] for p in dprofs if not (p.get("first_name") or p.get("surname"))]
         if unnamed:
             flags.append("No name on record: " + ", ".join(unnamed))
@@ -732,6 +803,16 @@ if is_super:
         if not flags:
             st.success("Nothing needs attention.")
 
+        # --- Admin activity ---
+        st.subheader("Admin activity")
+        if log is None:
+            st.info("Change tracking is not switched on yet. Run dashboard_migration.sql in Supabase to turn it on.")
+        elif arows:
+            st.dataframe(pd.DataFrame(arows), hide_index=True)
+        else:
+            st.caption("There are no Admins yet.")
+
+        # --- Programme for the selected month ---
         st.subheader(f"Programme - {month_label(month)}")
         total = len(cong) * len(mdates)
         filled = sum(1 for c in cong for d in mdates if val(book.get((c["id"], d), "")))
@@ -764,3 +845,42 @@ if is_super:
             st.markdown("**Possible double bookings (please check)**")
             for t in doubles:
                 st.warning(t)
+
+        # --- Recent changes ---
+        st.subheader("Recent changes")
+        if log is None:
+            st.info("Change tracking is not switched on yet. Run dashboard_migration.sql in Supabase to turn it on.")
+        elif not log:
+            st.caption("No changes recorded yet. Changes made from now on will appear here.")
+        else:
+            who = lambda r: by_email.get((r.get("user_email") or "").lower(), r.get("user_email") or "Supabase / system")
+
+            def describe(r):
+                old, new = r.get("old_value") or "", r.get("new_value") or ""
+                day = date.fromisoformat(r["item_date"]).strftime("%a %d %b") if r.get("item_date") else ""
+                if r["table_name"] == "service_dates":
+                    return f"Service date {day} {r['action']}"
+                if r["table_name"] == "bookings":
+                    where = f"{cn.get(r.get('congregation_id'), 'A congregation')}, {day}"
+                else:
+                    where = f"Programme, {r.get('item')}, {day}"
+                if r["action"] == "changed":
+                    return f"{where}: {old} -> {new}"
+                if r["action"] == "added":
+                    return f"{where}: set to {new}"
+                return f"{where}: cleared (was {old})"
+
+            grouped = {}
+            for r in log:
+                grouped.setdefault((r.get("user_email"), r["_t"].strftime("%Y-%m-%d %H:%M"), r["table_name"], r["action"]), []).append(r)
+            entries = []
+            for (_, _, tbl, act), rs in grouped.items():
+                if len(rs) >= 5:
+                    entries.append((rs[0]["_t"], who(rs[0]),
+                                    f"{act.capitalize()} {len(rs)} {tbl.replace('_', ' ')} entries at once (for example an Excel import)"))
+                else:
+                    entries.extend((r["_t"], who(r), describe(r)) for r in rs)
+            entries.sort(key=lambda e: e[0], reverse=True)
+            st.dataframe(pd.DataFrame([{"When": t.strftime("%d %b %H:%M"), "Who": w, "Change": c}
+                                       for t, w, c in entries[:40]]), hide_index=True)
+            st.caption("Times are South African time. The 40 most recent changes are shown.")
