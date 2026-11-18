@@ -1,5 +1,7 @@
 import calendar
 import json
+import os
+import tempfile
 import secrets as pysecrets
 import io
 from string import capwords
@@ -45,7 +47,7 @@ def login_screen():
         st.warning(f"You were signed out because you were inactive for {IDLE_MINUTES} minutes. Please sign in again.")
     note = st.session_state.get("restore_note")
     if note:
-        with st.expander("Why was I signed out?"):
+        with st.expander("Sign-in details (for troubleshooting)"):
             st.caption(note)
     t_in, t_up, t_rs = st.tabs(["Sign in", "Create viewer account", "Forgot password?"])
     with t_in:
@@ -123,42 +125,100 @@ def login_screen():
                             st.error(f"That did not work. Check the code, or ask for a new one. ({e})")
 
 # ---------- Stay signed in after a page refresh ----------
+# The login token is kept in the browser's own storage by a small hidden component.
 COOKIE, DAYS = "hm_rt", 30
 IDLE_MINUTES, WARN_SECONDS = 10, 10  # sign out after 10 minutes of inactivity, with a 10-second countdown
-if st.query_params.get("idle"):  # the browser sent us here after the countdown ended
-    saved = st.context.cookies.get(COOKIE)
-    if saved:
-        try:
-            sb.auth.refresh_session(saved)
-            sb.auth.sign_out()  # also cancels the saved login on Supabase's side
-        except Exception:
-            pass
-    st.session_state.cookie_js = ""
-    st.session_state.no_restore = True
-    st.session_state.idle_msg = True
-    st.query_params.clear()
-if "user" not in st.session_state and not st.session_state.get("no_restore"):
-    saved = st.context.cookies.get(COOKIE)
-    if saved:
-        try:
-            res = sb.auth.refresh_session(saved)
-            st.session_state.user = res.user
-            st.session_state.cookie_js = res.session.refresh_token  # tokens rotate, so store the new one
-            st.session_state.pop("restore_note", None)
-        except Exception as e:
-            st.session_state.cookie_js = ""  # stale cookie: clear it
-            st.session_state.restore_note = f"A saved sign-in was found in this browser but Supabase rejected it ({e})."
-    else:
-        st.session_state.restore_note = "No saved sign-in was found in this browser (the cookie is missing or was not sent to the app)."
+
+STORE_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8"></head><body><script>
+var NAME = "hm_rt", MAXAGE = 30 * 24 * 3600, readSent = false;
+function post(type, extra) {
+  var m = {isStreamlitMessage: true, type: type};
+  for (var k in extra) { m[k] = extra[k]; }
+  window.parent.postMessage(m, "*");
+}
+function readToken() {
+  var t = "";
+  try { t = window.localStorage.getItem(NAME) || ""; } catch (e) {}
+  if (!t) {
+    try {
+      var m = document.cookie.match(new RegExp("(?:^|; )" + NAME + "=([^;]*)"));
+      if (m) { t = decodeURIComponent(m[1]); }
+    } catch (e) {}
+  }
+  return t;
+}
+function writeToken(t) {
+  try { window.localStorage.setItem(NAME, t); } catch (e) {}
+  try { document.cookie = NAME + "=" + encodeURIComponent(t) + "; max-age=" + MAXAGE + "; path=/; SameSite=None; Secure"; } catch (e) {}
+}
+function clearToken() {
+  try { window.localStorage.removeItem(NAME); } catch (e) {}
+  try { document.cookie = NAME + "=; max-age=0; path=/; SameSite=None; Secure"; } catch (e) {}
+}
+window.addEventListener("message", function (ev) {
+  var d = ev.data;
+  if (!d || d.type !== "streamlit:render") { return; }
+  var a = d.args || {};
+  if (a.cmd === "read") {
+    if (!readSent) { readSent = true; post("streamlit:setComponentValue", {value: {token: readToken()}, dataType: "json"}); }
+  } else if (a.cmd === "write") { writeToken(a.token || ""); }
+  else if (a.cmd === "clear") { clearToken(); }
+});
+post("streamlit:componentReady", {apiVersion: 1});
+post("streamlit:setFrameHeight", {height: 0});
+</script></body></html>"""
 
 
-def write_cookie(tok):
+@st.cache_resource
+def store_component():
+    folder = os.path.join(tempfile.gettempdir(), "hm_store_component")
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "index.html"), "w", encoding="utf-8") as f:
+        f.write(STORE_HTML)
+    return components.declare_component("hm_store", path=folder)
+
+
+def write_cookie(tok, key="rt_write"):
     """Saves (or, if tok is empty, deletes) the login token in the browser."""
-    age = DAYS * 24 * 3600 if tok else 0
-    components.html(
-        "<script>var c=%s+'='+%s+'; max-age=%d; path=/; SameSite=None; Secure';"
-        "try{window.parent.document.cookie=c}catch(e){document.cookie=c}</script>"
-        % (json.dumps(COOKIE), json.dumps(tok), age), height=0)
+    store_component()(cmd="write" if tok else "clear", token=tok or "", key=key, default=None)
+
+
+def _skip_restore():
+    st.session_state.store_skip = True
+
+
+if "user" not in st.session_state and not st.session_state.get("no_restore") and not st.session_state.get("store_checked"):
+    if st.session_state.get("store_skip"):
+        st.session_state.store_checked = True
+    else:
+        got = store_component()(cmd="read", key="rt_read", default=None)
+        if got is None:  # the browser has not answered yet
+            st.caption("Loading...")
+            st.button("Sign in manually", key="skip_btn", on_click=_skip_restore)
+            st.stop()
+        st.session_state.store_checked = True
+        token = (got or {}).get("token", "")
+        idle = bool(st.query_params.get("idle"))  # the browser sent us here after the countdown ended
+        if token:
+            try:
+                res = sb.auth.refresh_session(token)
+                if idle:
+                    sb.auth.sign_out()  # also cancels the saved login on Supabase's side
+                    st.session_state.cookie_js = ""
+                    st.session_state.no_restore = True
+                else:
+                    st.session_state.user = res.user
+                    st.session_state.cookie_js = res.session.refresh_token  # tokens rotate, so store the new one
+                    st.session_state.pop("restore_note", None)
+            except Exception as e:
+                st.session_state.cookie_js = ""  # stale token: clear it
+                st.session_state.restore_note = f"A saved sign-in was found in this browser but Supabase rejected it ({e})."
+        else:
+            st.session_state.restore_note = "No saved sign-in was found in this browser."
+        if idle:
+            st.session_state.idle_msg = True
+            st.session_state.no_restore = True
+            st.query_params.clear()
 
 
 if "cookie_js" in st.session_state:
@@ -180,7 +240,7 @@ def keep_alive():
         sess = sb.auth.get_session()
         if sess and sess.refresh_token != st.session_state.get("rt_last"):
             st.session_state.rt_last = sess.refresh_token
-            write_cookie(sess.refresh_token)
+            write_cookie(sess.refresh_token, key="rt_write_ka")
     except Exception:
         pass
 
